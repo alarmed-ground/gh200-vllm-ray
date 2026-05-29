@@ -1,0 +1,311 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: vllm-gh200-ray
+  namespace: vllm
+spec:
+  rayVersion: "2.55.0"
+
+  headGroupSpec:
+    serviceType: ClusterIP
+    replicas: 1
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+      port: "6379"
+    template:
+      metadata:
+        labels:
+          app: qwen-gh200
+          ray.io/node-type: head
+        annotations:
+          prometheus.io/scrape: "true"
+          prometheus.io/port: "8080"
+          prometheus.io/path: "/metrics"
+      spec:
+        hostNetwork: true
+        dnsPolicy: ClusterFirstWithHostNet
+        securityContext:
+          runAsUser: 0
+          runAsGroup: 0
+          fsGroup: 1000
+        nodeName: node1
+        volumes:
+          - name: hf-cache
+            persistentVolumeClaim:
+              claimName: placeholder-hf-cache-pvc
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+          - name: model1-script
+            configMap:
+              name: vllm-model1-script
+              defaultMode: 0755
+          - name: model2-script
+            configMap:
+              name: vllm-model2-script
+              defaultMode: 0755
+          - name: router-script
+            configMap:
+              name: vllm-router-script
+              defaultMode: 0755
+          - name: vllm-combined-script
+            configMap:
+              name: vllm-combined-script
+              defaultMode: 0755
+        containers:
+          - name: ray-head
+            image: ghcr.io/alarmed-ground/gh200-vllm-ray:nightly-x86_64
+            ports:
+              - containerPort: 6379
+                name: gcs
+              - containerPort: 8265
+                name: dashboard
+              - containerPort: 10001
+                name: client
+              - containerPort: 8000
+                name: model1
+              - containerPort: 8001
+                name: model2
+              - containerPort: 9000
+                name: router
+              - containerPort: 8080
+                name: metrics
+            env:
+              - name: HF_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: hf-secret
+                    key: token
+              - name: HF_HUB_ENABLE_HF_TRANSFER
+                value: "1"
+              - name: NCCL_DEBUG
+                value: INFO
+              - name: NCCL_IB_DISABLE
+                value: "0"
+              - name: NCCL_SOCKET_IFNAME
+                value: nm-bond
+              - name: NCCL_IB_HCA
+                value: mlx5
+              - name: GLOO_SOCKET_IFNAME
+                value: nm-bond
+              - name: TP_SOCKET_IFNAME
+                value: nm-bond
+            volumeMounts:
+              - name: hf-cache
+                mountPath: /root/.cache/huggingface
+              - name: dshm
+                mountPath: /dev/shm
+              - name: model1-script
+                mountPath: /serve/model1
+              - name: model2-script
+                mountPath: /serve/model2
+              - name: router-script
+                mountPath: /serve/router
+              - name: vllm-combined-script
+                mountPath: /serve/vllm-combined
+            resources:
+              requests:
+                cpu: "16"
+                memory: 32Gi
+              limits:
+                cpu: "32"
+                memory: 64Gi
+
+  workerGroupSpecs:
+    - groupName: gh200-worker-1
+      replicas: 1
+      rayStartParams:
+        num-gpus: "1"
+      template:
+        metadata:
+          labels:
+            app: qwen-gh200
+            ray.io/node-type: worker
+          annotations:
+            prometheus.io/scrape: "true"
+            prometheus.io/port: "8080"
+            prometheus.io/path: "/metrics"
+        spec:
+          runtimeClassName: nvidia
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            fsGroup: 1000
+          nodeSelector:
+            node-role: s7g
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchExpressions:
+                      - key: ray.io/node-type
+                        operator: In
+                        values:
+                          - worker
+                  topologyKey: kubernetes.io/hostname
+          volumes:
+            - name: hf-cache
+              persistentVolumeClaim:
+                claimName: placeholder-hf-cache-pvc
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 64Gi
+          containers:
+            - name: ray-worker
+              image: ghcr.io/alarmed-ground/gh200-vllm-ray:nightly-arm64
+              ports:
+                - containerPort: 8080
+                  name: metrics
+              env:
+                - name: HF_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: hf-secret
+                      key: token
+                - name: HF_HUB_ENABLE_HF_TRANSFER
+                  value: "1"
+                - name: NCCL_DEBUG
+                  value: INFO
+                - name: NCCL_IB_DISABLE
+                  value: "0"
+                - name: NCCL_SOCKET_IFNAME
+                  value: nm-bond
+                - name: NCCL_IB_HCA
+                  value: mlx5
+                - name: GLOO_SOCKET_IFNAME
+                  value: nm-bond
+                - name: TP_SOCKET_IFNAME
+                  value: nm-bond
+              volumeMounts:
+                - name: hf-cache
+                  mountPath: /root/.cache/huggingface
+                - name: dshm
+                  mountPath: /dev/shm
+              resources:
+                requests:
+                  nvidia.com/gpu: 1
+                  cpu: "32"
+                  memory: 400Gi
+                limits:
+                  nvidia.com/gpu: 1
+                  cpu: "64"
+                  memory: 420Gi
+    - groupName: gh200-worker-2
+      replicas: 1
+      rayStartParams:
+        num-gpus: "1"
+      template:
+        metadata:
+          labels:
+            app: qwen-gh200
+            ray.io/node-type: worker
+          annotations:
+            prometheus.io/scrape: "true"
+            prometheus.io/port: "8080"
+            prometheus.io/path: "/metrics"
+        spec:
+          runtimeClassName: nvidia
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            fsGroup: 1000
+          nodeSelector:
+            node-role: s7g
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchExpressions:
+                      - key: ray.io/node-type
+                        operator: In
+                        values:
+                          - worker
+                  topologyKey: kubernetes.io/hostname
+          volumes:
+            - name: hf-cache
+              persistentVolumeClaim:
+                claimName: placeholder-hf-cache-pvc
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 64Gi
+          containers:
+            - name: ray-worker
+              image: ghcr.io/alarmed-ground/gh200-vllm-ray:nightly-arm64
+              ports:
+                - containerPort: 8080
+                  name: metrics
+              env:
+                - name: HF_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: hf-secret
+                      key: token
+                - name: HF_HUB_ENABLE_HF_TRANSFER
+                  value: "1"
+                - name: NCCL_DEBUG
+                  value: INFO
+                - name: NCCL_IB_DISABLE
+                  value: "0"
+                - name: NCCL_SOCKET_IFNAME
+                  value: nm-bond
+                - name: NCCL_IB_HCA
+                  value: mlx5
+                - name: GLOO_SOCKET_IFNAME
+                  value: nm-bond
+                - name: TP_SOCKET_IFNAME
+                  value: nm-bond
+              volumeMounts:
+                - name: hf-cache
+                  mountPath: /root/.cache/huggingface
+                - name: dshm
+                  mountPath: /dev/shm
+              resources:
+                requests:
+                  nvidia.com/gpu: 1
+                  cpu: "32"
+                  memory: 400Gi
+                limits:
+                  nvidia.com/gpu: 1
+                  cpu: "64"
+                  memory: 420Gi
+    - groupName: gh200-worker-3
+      replicas: 1
+      minReplicas: 1
+      maxReplicas: 1
+      rayStartParams:
+        num-gpus: "1"
+      template:
+        spec:
+          nodeName: node3-quantagrid-s74g-2u-1s7g2000026
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          volumes:
+            - name: movigo-vllm-storage
+              persistentVolumeClaim:
+                claimName: placeholder-vllm-model-storage-pvc
+          containers:
+            - name: ray-worker
+              image: ghcr.io/alarmed-ground/gh200-vllm-ray:nightly-arm64
+              imagePullPolicy: IfNotPresent
+              ports:
+                - containerPort: 8001
+                  name: model2
+              resources:
+                limits:
+                  cpu: "32"
+                  memory: "256Gi"
+                  nvidia.com/gpu: 1
+                requests:
+                  cpu: "32"
+                  memory: "256Gi"
+                  nvidia.com/gpu: 1
+              volumeMounts:
+                - name: movigo-vllm-storage
+                  mountPath: /models
