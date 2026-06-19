@@ -1,0 +1,302 @@
+apiVersion: ray.io/v1
+kind: RayService
+metadata:
+  name: vllm-serve
+  namespace: vllm
+spec:
+  serviceUnhealthySecondThreshold: 900
+  deploymentUnhealthySecondThreshold: 900
+
+  serveConfigV2: |
+    applications:
+      - name: vllm-app
+        import_path: serve_app:app
+        route_prefix: /
+
+  rayClusterConfig:
+    rayVersion: "2.55.1"
+
+    headGroupSpec:
+      serviceType: NodePort
+      rayStartParams:
+        dashboard-host: "0.0.0.0"
+        num-gpus: "1"
+        node-ip-address: ""
+        port: "6379"
+      template:
+        metadata:
+          labels:
+            app: qwen-gh200
+            ray.io/node-type: head
+          annotations:
+            prometheus.io/scrape: "true"
+            prometheus.io/port: "8080"
+            prometheus.io/path: "/metrics"
+        spec:
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          nodeName: s5n
+          runtimeClassName: nvidia
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            fsGroup: 1000
+          tolerations:
+            - key: nvidia.com/gpu
+              operator: Exists
+              effect: NoSchedule
+          volumes:
+            - name: hf-cache
+              persistentVolumeClaim:
+                claimName: hf-cache
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 64Gi
+            - name: serve-script
+              configMap:
+                name: vllm-serve-script
+                defaultMode: 0755
+          containers:
+            - name: ray-head
+              image: ghcr.io/alarmed-ground/gh200-vllm-ray:nightly-x86_64
+              lifecycle:
+                preStop:
+                  exec:
+                    command:
+                      - /bin/bash
+                      - -c
+                      - ray stop --force && sleep 5
+              securityContext:
+                privileged: true
+                allowPrivilegeEscalation: true
+                capabilities:
+                  add:
+                    - IPC_LOCK
+                    - SYS_RESOURCE
+                    - SYS_NICE
+              ports:
+                - containerPort: 6379
+                  name: gcs
+                - containerPort: 8265
+                  name: dashboard
+                - containerPort: 10001
+                  name: client
+                - containerPort: 8000
+                  name: serve
+                - containerPort: 8080
+                  name: metrics
+              env:
+                - name: HF_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: hf-secret
+                      key: token
+                - name: HF_HOME
+                  value: /root/.cache/huggingface
+                - name: PYTHONPATH
+                  value: /serve
+                # Model selection — change these to switch models without editing serve_app.py
+                - name: MODEL_PATH
+                  value: /root/.cache/huggingface/hub/gemma-4-31B-it-local
+                - name: SERVED_MODEL_NAME
+                  value: intrallmai/intrallm-gemma4
+                - name: TENSOR_PARALLEL_SIZE
+                  value: "2"
+                - name: MAX_MODEL_LEN
+                  value: "132000"
+                - name: VLLM_API_KEY
+                  value: ""
+                # Leave REASONING_PARSER / TOOL_CALL_PARSER / HF_OVERRIDES_JSON unset
+                # unless the target model architecture supports them (e.g. Qwen3 family)
+                - name: HF_HUB_ENABLE_HF_TRANSFER
+                  value: "1"
+                - name: CUDA_DEVICE_ORDER
+                  value: PCI_BUS_ID
+                - name: NCCL_DEBUG
+                  value: "INFO"
+                - name: NCCL_IB_DISABLE
+                  value: "0"
+                - name: NCCL_SOCKET_IFNAME
+                  value: enp163s0np0
+                - name: NCCL_IB_HCA
+                  value: mlx5
+                - name: NCCL_IB_GID_INDEX
+                  value: "1"
+                - name: GLOO_SOCKET_IFNAME
+                  value: enp163s0np0
+                - name: TP_SOCKET_IFNAME
+                  value: enp163s0np0
+                - name: NCCL_NET_GDR_LEVEL
+                  value: "2"
+                - name: NCCL_P2P_LEVEL
+                  value: SYS
+                - name: NCCL_CROSS_NIC
+                  value: "1"
+                - name: PYTORCH_CUDA_ALLOC_CONF
+                  value: "expandable_segments:True"
+                - name: VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
+                  value: "1"
+                - name: VLLM_USE_SIMPLE_KV_OFFLOAD
+                  value: "1"
+                - name: VLLM_USE_V1
+                  value: "1"
+                - name: RAY_CGRAPH_get_timeout
+                  value: "120"
+                - name: NCCL_TIMEOUT
+                  value: "120"
+                - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
+                  value: "120"
+                - name: VLLM_WORKER_MULTIPROC_METHOD
+                  value: "spawn"
+                - name: RAY_raylet_start_wait_time_s
+                  value: "300"
+              volumeMounts:
+                - name: hf-cache
+                  mountPath: /root/.cache/huggingface
+                - name: dshm
+                  mountPath: /dev/shm
+                - name: serve-script
+                  mountPath: /serve
+              resources:
+                requests:
+                  nvidia.com/gpu: 1
+                  cpu: "32"
+                  memory: 64Gi
+                limits:
+                  nvidia.com/gpu: 1
+                  cpu: "64"
+                  memory: 64Gi
+
+    workerGroupSpecs:
+      - groupName: gh200-workers
+        replicas: 1
+        rayStartParams:
+          num-gpus: "1"
+          address: ""
+          node-ip-address: ""
+        template:
+          metadata:
+            labels:
+              app: qwen-gh200
+              ray.io/node-type: worker
+            annotations:
+              prometheus.io/scrape: "true"
+              prometheus.io/port: "8080"
+              prometheus.io/path: "/metrics"
+          spec:
+            hostNetwork: true
+            dnsPolicy: ClusterFirstWithHostNet
+            nodeName: ahg1
+            runtimeClassName: nvidia
+            securityContext:
+              runAsUser: 0
+              runAsGroup: 0
+              fsGroup: 1000
+            tolerations:
+              - key: nvidia.com/gpu
+                operator: Exists
+                effect: NoSchedule
+            volumes:
+              - name: hf-cache
+                persistentVolumeClaim:
+                  claimName: hf-cache
+              - name: dshm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 64Gi
+              - name: serve-script
+                configMap:
+                  name: vllm-serve-script
+                  defaultMode: 0755
+            containers:
+              - name: ray-worker
+                image: ghcr.io/alarmed-ground/gh200-vllm-ray:nightly-x86_64
+                lifecycle:
+                  preStop:
+                    exec:
+                      command:
+                        - /bin/bash
+                        - -c
+                        - ray stop --force && sleep 5
+                securityContext:
+                  privileged: true
+                  allowPrivilegeEscalation: true
+                  capabilities:
+                    add:
+                      - IPC_LOCK
+                      - SYS_RESOURCE
+                      - SYS_NICE
+                ports:
+                  - containerPort: 8080
+                    name: metrics
+                env:
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-secret
+                        key: token
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
+                  - name: PYTHONPATH
+                    value: /serve
+                  - name: HF_HUB_ENABLE_HF_TRANSFER
+                    value: "1"
+                  - name: CUDA_DEVICE_ORDER
+                    value: PCI_BUS_ID
+                  - name: NCCL_DEBUG
+                    value: "INFO"
+                  - name: NCCL_IB_DISABLE
+                    value: "0"
+                  - name: NCCL_SOCKET_IFNAME
+                    value: enp163s0np0
+                  - name: NCCL_IB_HCA
+                    value: mlx5
+                  - name: NCCL_IB_GID_INDEX
+                    value: "1"
+                  - name: GLOO_SOCKET_IFNAME
+                    value: enp163s0np0
+                  - name: TP_SOCKET_IFNAME
+                    value: enp163s0np0
+                  - name: NCCL_NET_GDR_LEVEL
+                    value: "2"
+                  - name: NCCL_P2P_LEVEL
+                    value: SYS
+                  - name: NCCL_CROSS_NIC
+                    value: "1"
+                  - name: PYTORCH_CUDA_ALLOC_CONF
+                    value: "expandable_segments:True"
+                  - name: VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
+                    value: "1"
+                  - name: VLLM_USE_SIMPLE_KV_OFFLOAD
+                    value: "1"
+                  - name: VLLM_USE_V1
+                    value: "1"
+                  - name: RAY_CGRAPH_get_timeout
+                    value: "120"
+                  - name: NCCL_TIMEOUT
+                    value: "120"
+                  - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
+                    value: "120"
+                  - name: VLLM_WORKER_MULTIPROC_METHOD
+                    value: "spawn"
+                  - name: RAY_raylet_start_wait_time_s
+                    value: "300"
+                  - name: RAY_ADDRESS
+                    value: ""
+                volumeMounts:
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                  - name: dshm
+                    mountPath: /dev/shm
+                  - name: serve-script
+                    mountPath: /serve
+                resources:
+                  requests:
+                    nvidia.com/gpu: 1
+                    cpu: "32"
+                    memory: 64Gi
+                  limits:
+                    nvidia.com/gpu: 1
+                    cpu: "64"
+                    memory: 64Gi
