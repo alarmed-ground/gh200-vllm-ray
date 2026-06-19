@@ -1,0 +1,162 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vllm-serve-script
+  namespace: vllm
+data:
+  serve_app.py: |
+    #!/usr/bin/env python3
+    """
+    Model-agnostic vLLM Ray Serve entrypoint.
+    Set MODEL_PATH, SERVED_MODEL_NAME, and optional REASONING_PARSER /
+    TOOL_CALL_PARSER / HF_OVERRIDES_JSON via env vars (or edit MODEL_CONFIG
+    below) to switch models without touching parser/arch-specific flags
+    that only apply to certain model families.
+    """
+    import os
+    from ray import serve
+
+    # ---- Per-model configuration ----
+    # Edit this block when switching models. Only include parser/override
+    # flags that are valid for the target architecture.
+    MODEL_PATH = os.environ.get(
+        "MODEL_PATH", "/root/.cache/huggingface/hub/gemma-4-31B-it-local"
+    )
+    SERVED_MODEL_NAME = os.environ.get(
+        "SERVED_MODEL_NAME", "intrallmai/intrallm-gemma4"
+    )
+    TENSOR_PARALLEL_SIZE = os.environ.get("TENSOR_PARALLEL_SIZE", "2")
+    MAX_MODEL_LEN = os.environ.get("MAX_MODEL_LEN", "132000")
+    API_KEY = os.environ.get("VLLM_API_KEY", "")
+
+    # Optional, leave empty string to omit. Only set these if the model
+    # architecture actually supports them (Qwen3-family only, for example).
+    REASONING_PARSER = os.environ.get("REASONING_PARSER", "")        # e.g. "qwen3"
+    TOOL_CALL_PARSER = os.environ.get("TOOL_CALL_PARSER", "")        # e.g. "qwen3_coder"
+    HF_OVERRIDES_JSON = os.environ.get("HF_OVERRIDES_JSON", "")      # raw JSON string, "" to omit
+
+    VLLM_ARGS = [
+        "--model", MODEL_PATH,
+        "--host", "0.0.0.0",
+        "--port", "8001",
+        "--distributed-executor-backend", "ray",
+        "--tensor-parallel-size", TENSOR_PARALLEL_SIZE,
+        "--pipeline-parallel-size", "1",
+        "--gpu-memory-utilization", "0.95",
+        "--max-num-seqs", "32",
+        "--max-model-len", MAX_MODEL_LEN,
+        "--enable-prefix-caching",
+        "--trust-remote-code",
+        "--served-model-name", SERVED_MODEL_NAME,
+        "--api-key", API_KEY,
+        "--safetensors-load-strategy=prefetch",
+    ]
+
+    if REASONING_PARSER:
+        VLLM_ARGS += ["--reasoning-parser", REASONING_PARSER]
+    if TOOL_CALL_PARSER:
+        VLLM_ARGS += ["--enable-auto-tool-choice", "--tool-call-parser", TOOL_CALL_PARSER]
+    if HF_OVERRIDES_JSON:
+        VLLM_ARGS += ["--hf-overrides", HF_OVERRIDES_JSON]
+
+
+    @serve.deployment(
+        name="VLLMDeployment",
+        num_replicas=1,
+        max_ongoing_requests=32,
+        health_check_period_s=30,
+        health_check_timeout_s=120,
+        graceful_shutdown_timeout_s=60,
+        graceful_shutdown_wait_loop_s=2,
+        ray_actor_options={
+            # No GPU reserved here. The vLLM subprocess launched in __init__
+            # creates its own Ray placement group(s) for tensor_parallel_size
+            # GPU workers. Reserving a GPU on this actor too would over-commit
+            # the cluster (this actor's 1 + vLLM's N = more than total GPUs).
+            "num_cpus": 16,
+        },
+    )
+    class VLLMDeployment:
+        def __init__(self):
+            import subprocess
+            import sys
+            import time
+            import httpx
+
+            cmd = [sys.executable, "-m", "vllm.entrypoints.openai.api_server"] + VLLM_ARGS
+            print(f"Launching vLLM with args: {VLLM_ARGS}", flush=True)
+            self._proc = subprocess.Popen(cmd)
+
+            base_url = "http://localhost:8001"
+            deadline = time.time() + 600
+            while time.time() < deadline:
+                try:
+                    r = httpx.get(f"{base_url}/health", timeout=2)
+                    if r.status_code == 200:
+                        break
+                except Exception:
+                    pass
+                if self._proc.poll() is not None:
+                    raise RuntimeError(
+                        f"vLLM process exited early with code {self._proc.returncode}. "
+                        f"Check replica logs for the underlying error."
+                    )
+                time.sleep(5)
+            else:
+                self._proc.kill()
+                raise RuntimeError("vLLM failed to become ready within 600s")
+
+            self._client = httpx.AsyncClient(
+                base_url=base_url,
+                timeout=httpx.Timeout(300.0),
+            )
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] != "http":
+                return
+
+            body = b""
+            while True:
+                msg = await receive()
+                body += msg.get("body", b"")
+                if not msg.get("more_body", False):
+                    break
+
+            url = scope["path"]
+            if scope.get("query_string"):
+                url += "?" + scope["query_string"].decode()
+
+            headers = {
+                k.decode(): v.decode()
+                for k, v in scope["headers"]
+                if k.lower() not in (b"host", b"content-length")
+            }
+
+            resp = await self._client.request(
+                method=scope["method"],
+                url=url,
+                content=body,
+                headers=headers,
+            )
+
+            await send({
+                "type": "http.response.start",
+                "status": resp.status_code,
+                "headers": [
+                    [k.lower().encode(), v.encode()]
+                    for k, v in resp.headers.items()
+                ],
+            })
+            await send({
+                "type": "http.response.body",
+                "body": resp.content,
+            })
+
+        def __del__(self):
+            if hasattr(self, "_proc"):
+                self._proc.terminate()
+
+    app = VLLMDeployment.bind()
+
+    if __name__ == "__main__":
+        serve.run(app, host="0.0.0.0", port=8000)
